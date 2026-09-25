@@ -7,10 +7,14 @@
 2. 提交实盘(submitted):逐项校验样品仍存在、且数据库余量自快照以来未被
    其他操作改变(samples.version 乐观锁,余量变动即 +1),计算
    差异 = 实盘量 − 系统量。本步不改任何库存。
-3. 确认(confirmed):在一个事务内对每一项**再次**校验版本仍等于提交时版本;
-   全部通过才把确认的实盘量写入盘点调整流水(stocktake_adjustments)、
-   更新样品余量(并再 +1 版本),同时记录操作者与原因。
-   任一项冲突则整批回滚,库存一律不动。
+3. 确认(confirmed):在一个事务内对每一项**再次**校验版本仍等于提交时版本,
+   并按**确认时刻**的活跃预留(未释放预留的未核销锁定合计,与可用量查询同
+   口径)逐项核对实盘量不低于当前锁定量;全部通过才把确认的实盘量写入盘点
+   调整流水(stocktake_adjustments)、更新样品余量(并再 +1 版本),同时记录
+   操作者与原因。任一项版本或锁定冲突则整批回滚,库存一律不动。
+   提交实盘本身不校验锁定量,仍如实记录真实实盘值;提交→确认之间新增、
+   释放或分次核销的预留均以确认时状态判定,锁定量下降后可直接重试原批次
+   的确认(无需重建批次)。
 
 幂等
 ----
@@ -24,6 +28,7 @@ from __future__ import annotations
 import sqlite3
 from typing import Optional
 
+from . import reservations as rsv
 from . import schemas as s
 
 _EPS = 1e-9  # 运算时浮点比较
@@ -387,7 +392,12 @@ def confirm_stocktake(
     stocktake_no: str,
     req: s.StocktakeConfirmRequest,
 ) -> s.StocktakeResponse:
-    """事务内二次校验版本,写调整流水并更新余量;任一冲突整批不改库存。"""
+    """事务内二次校验版本并按活跃预留锁定量核对实盘,全部通过才写调整流水。
+
+    实盘量低于确认时刻活跃预留的未核销锁定量时,与版本冲突一样逐项收集,
+    整批不写调整流水、不改余量或状态;锁定量(如预留被释放)下降后可直接
+    重试同一批次的确认。
+    """
     conn.execute("BEGIN IMMEDIATE")
     try:
         header = _get_header(conn, stocktake_no)
@@ -424,8 +434,18 @@ def confirm_stocktake(
 
         items = _load_items(conn, stocktake_no)
 
+        # 确认时刻的活跃预留锁定量(未释放预留的未核销锁定合计,与可用量
+        # 查询同口径):提交→确认之间新增/释放/分次核销的预留均以此刻状态
+        # 实时重算,因此释放预留使锁定下降后可直接重试原批次确认。
+        avail = rsv._availability_map(
+            conn, [it["sample_id"] for it in items]
+        )
+
         # 1) 事务内逐项再次校验:样品仍存在 + 版本仍等于提交时版本
-        #    (即提交→确认之间数据库余量没有被任何其他操作改变)
+        #    (即提交→确认之间数据库余量没有被任何其他操作改变);
+        #    同时校验实盘量不低于确认时刻的活跃预留锁定量,
+        #    否则调账后可用量为负、预留无法足额核销。
+        #    两类冲突逐项收集,任一存在即整批拒绝,不写任何调整流水。
         conflicts: list[s.Conflict] = []
         current: dict[str, sqlite3.Row] = {}
         for it in items:
@@ -452,6 +472,24 @@ def confirm_stocktake(
                     sample_id=it["sample_id"],
                     requested=it["submitted_version"],
                     available=cur["version"],
+                ))
+
+            counted_amount = _r(it["counted_amount"])
+            locked = _r(avail.get(it["sample_id"], {}).get("reserved", 0.0))
+            if counted_amount + _EPS < locked:
+                available_after = _r(counted_amount - locked)
+                conflicts.append(_conflict(
+                    "stocktake_count_below_locked",
+                    f"样品 {it['sample_id']} 实盘量 {counted_amount} {cur['unit']}"
+                    f" 低于确认时刻活跃预留的未核销锁定量 {locked} {cur['unit']}"
+                    f"(当前余量 {_r(cur['remaining'])});按实盘调账后可用量将变为"
+                    f" {available_after} {cur['unit']},活跃预留将无法足额核销。"
+                    "整批拒绝调整:请先释放/核销相关预留(锁定量下降后可重试确认),"
+                    "或重新实盘建批",
+                    stocktake_no=stocktake_no,
+                    sample_id=it["sample_id"],
+                    requested=counted_amount,
+                    available=locked,
                 ))
         if conflicts:
             raise StocktakeError(conflicts)
