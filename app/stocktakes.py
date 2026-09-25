@@ -7,16 +7,21 @@
 2. 提交实盘(submitted):逐项校验样品仍存在、且数据库余量自快照以来未被
    其他操作改变(samples.version 乐观锁,余量变动即 +1),计算
    差异 = 实盘量 − 系统量。本步不改任何库存。
-3. 确认(confirmed):在一个事务内对每一项**再次**校验版本仍等于提交时版本;
+3. 确认(confirmed):在一个事务内对每一项**再次**校验版本仍等于提交时版本,
+   并按**确认时刻**的活跃预留(未释放预留扣除已核销领用后的锁定合计)逐项
+   校验实盘量不低于锁定量——否则调账后可用量将为负、预留无法足额核销。
    全部通过才把确认的实盘量写入盘点调整流水(stocktake_adjustments)、
    更新样品余量(并再 +1 版本),同时记录操作者与原因。
-   任一项冲突则整批回滚,库存一律不动。
+   版本冲突或实盘量低于锁定量都**逐项收集后一次返回**,任一项冲突则整批回滚,
+   库存一律不动、批次保持 submitted。提交→确认之间新增/释放预留或分次核销
+   均以确认时状态判定锁定量;锁定量下降后(如释放预留)可直接重试原批次确认。
 
 幂等
 ----
 - 建批:同批次号 + 同请求体重放返回当前批次结果(`replayed: true`);
   同号不同内容返回 `409 stocktake_no_conflict`。
 - 提交:submitted 状态下同请求体重放;不同内容 `409 stocktake_result_conflict`。
+  提交只记录真实实盘量,不校验活跃预留(实盘量低于锁定量在确认时拦截)。
 - 确认:confirmed 状态下重复确认幂等回放原调整结果。
 """
 from __future__ import annotations
@@ -24,6 +29,7 @@ from __future__ import annotations
 import sqlite3
 from typing import Optional
 
+from . import reservations as rsv
 from . import schemas as s
 
 _EPS = 1e-9  # 运算时浮点比较
@@ -252,6 +258,8 @@ def submit_stocktake(
     """逐项校验样品仍存在且余量未被其他操作改变,计算差异;不改库存。
 
     提交内容必须与批次明细**逐项一致**(同样品集合,不重不漏)。
+    实盘量只做真实记录(允许为 0),不因活跃预留被拒;实盘量低于锁定量
+    在确认阶段按确认时状态拦截。
     """
     payload = req.model_dump_json()
 
@@ -387,7 +395,13 @@ def confirm_stocktake(
     stocktake_no: str,
     req: s.StocktakeConfirmRequest,
 ) -> s.StocktakeResponse:
-    """事务内二次校验版本,写调整流水并更新余量;任一冲突整批不改库存。"""
+    """事务内二次校验版本并按确认时活跃预留校验实盘量,写调整流水并更新余量。
+
+    任一冲突整批不改库存:版本冲突(提交→确认之间余量被其他操作改变)或
+    实盘量低于确认时活跃预留的未核销锁定量(调账后可用量为负、预留无法
+    足额核销)均逐项收集后一次返回。锁定量以确认时刻状态判定,锁定下降后
+    可直接重试本批次确认。
+    """
     conn.execute("BEGIN IMMEDIATE")
     try:
         header = _get_header(conn, stocktake_no)
@@ -426,6 +440,10 @@ def confirm_stocktake(
 
         # 1) 事务内逐项再次校验:样品仍存在 + 版本仍等于提交时版本
         #    (即提交→确认之间数据库余量没有被任何其他操作改变)
+        #    同时按**确认时刻**状态计算各样品活跃预留(扣除已核销)的锁定量:
+        #    实盘量低于锁定量时调账会令可用量为负、预留无法足额核销,必须拒绝。
+        #    提交→确认之间新增/释放预留、分次核销都在此刻实时反映,
+        #    锁定量下降后可直接重试原批次确认(无需重建批次)。
         conflicts: list[s.Conflict] = []
         current: dict[str, sqlite3.Row] = {}
         for it in items:
@@ -452,6 +470,30 @@ def confirm_stocktake(
                     sample_id=it["sample_id"],
                     requested=it["submitted_version"],
                     available=cur["version"],
+                ))
+
+        # 活跃预留逐项锁定量:同一口径复用预留模块的可用量视图
+        # (只计未释放预留的未核销部分,分次核销自动冲减)
+        avail = rsv._availability_map(conn, list(current.keys()))
+        for it in items:
+            cur = current.get(it["sample_id"])
+            if cur is None:
+                continue
+            counted_amount = _r(it["counted_amount"])
+            locked = avail[it["sample_id"]]["reserved"]
+            if counted_amount + _EPS < locked:
+                conflicts.append(_conflict(
+                    "stocktake_counted_below_reserved",
+                    f"样品 {it['sample_id']} 实盘量 {counted_amount} {cur['unit']}"
+                    f" 低于确认时活跃预留的未核销锁定量 {locked} {cur['unit']},"
+                    f"若按实盘调账,可用量将变为 {_r(counted_amount - locked)}"
+                    f" {cur['unit']} 且预留无法足额核销,整批拒绝调整;"
+                    "请核销/释放相关预留使锁定量下降后重试原批次确认,"
+                    "或重新盘点后重建批次",
+                    stocktake_no=stocktake_no,
+                    sample_id=it["sample_id"],
+                    requested=counted_amount,
+                    available=locked,
                 ))
         if conflicts:
             raise StocktakeError(conflicts)

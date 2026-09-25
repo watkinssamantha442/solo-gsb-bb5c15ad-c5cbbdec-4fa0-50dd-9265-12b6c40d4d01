@@ -58,6 +58,25 @@ def _confirm(client, no, operator="张库管", reason="月度盘点差异调整"
     })
 
 
+def _reserve(client, no, sid, amount):
+    r = client.post("/api/v1/reservations", json={
+        "reservation_no": no,
+        "items": [{"sample_id": sid, "amount": amount}],
+    })
+    assert r.status_code == 200, r.text
+    return r
+
+
+def _consume(client, cno, rno, sid, amount, operator="吴九"):
+    r = client.post("/api/v1/consumptions", json={
+        "consumption_no": cno, "reservation_no": rno,
+        "operator": operator,
+        "items": [{"sample_id": sid, "amount": amount}],
+    })
+    assert r.status_code == 200, r.text
+    return r
+
+
 # ---------------------------------------------------------------- 建批 / 快照
 
 def test_create_stocktake_snapshots_remaining_and_version(client):
@@ -354,6 +373,183 @@ def test_zero_delta_leaves_version_untouched(client):
     # 仍保留一条零差异审计流水
     assert len(r.json()["adjustments"]) == 1
     assert r.json()["adjustments"][0]["to_version"] == 0
+
+
+# ---------------------------------------------------------------- 确认:活跃预留锁定量防护
+
+def test_confirm_rejected_when_counted_below_active_reservation(client):
+    """余量 100、活跃预留未核销 80,实盘 50 确认必须被拒,整批不改任何库存。"""
+    _sample(client, "OP-1", "S1", 100)
+    _reserve(client, "RSV-1", "S1", 80)  # 锁 80,可用 20
+    _create(client, sids=("S1",))
+    _submit(client, "STK-1", [("S1", 50)])  # 提交仍可记录真实实盘值
+
+    r = _confirm(client, "STK-1")
+    assert r.status_code == 409
+    c = r.json()["conflicts"][0]
+    assert c["code"] == "stocktake_counted_below_reserved"
+    assert c["sample_id"] == "S1"
+    assert c["requested"] == 50.0   # 实盘量
+    assert c["available"] == 80.0   # 确认时锁定量
+    assert "-30.0" in c["message"]  # 调账后可用量将为 -30
+
+    # 整批不写调整流水、不改余量/版本、批次保持 submitted,预留仍可足额核销
+    got = client.get("/api/v1/stocktakes/STK-1").json()
+    assert got["status"] == "submitted"
+    assert got["adjustments"] == []
+    assert got["items"][0]["delta_applied"] is None
+    avail = client.get("/api/v1/reservations?sample_id=S1").json()["samples"][0]
+    assert avail["remaining"] == 100.0
+    assert avail["reserved"] == 80.0
+    assert avail["available"] == 20.0
+
+
+def test_confirm_lock_conflict_collects_all_items_and_rolls_back(client):
+    """多样品同时实盘低于锁定量时逐项冲突一次返回,整批无一项落调整。"""
+    _sample(client, "OP-1", "S1", 100)
+    _sample(client, "OP-2", "S2", 100)
+    _reserve(client, "RSV-1", "S1", 80)
+    _reserve(client, "RSV-2", "S2", 40)
+    _create(client)
+    _submit(client, "STK-1", [("S1", 50), ("S2", 10)])
+
+    r = _confirm(client, "STK-1")
+    assert r.status_code == 409
+    conflicts = r.json()["conflicts"]
+    by_sample = {c["sample_id"]: c for c in conflicts}
+    assert set(by_sample) == {"S1", "S2"}
+    assert by_sample["S1"]["code"] == "stocktake_counted_below_reserved"
+    assert by_sample["S1"]["requested"] == 50.0
+    assert by_sample["S1"]["available"] == 80.0
+    assert by_sample["S2"]["requested"] == 10.0
+    assert by_sample["S2"]["available"] == 40.0
+
+    got = client.get("/api/v1/stocktakes/STK-1").json()
+    assert got["status"] == "submitted"
+    assert got["adjustments"] == []
+    rem = {
+        x["sample_id"]: x["remaining"]
+        for x in client.get("/api/v1/samples").json()["items"]
+    }
+    assert rem == {"S1": 100.0, "S2": 100.0}
+
+
+def test_confirm_lock_judged_at_confirm_time_release_then_retry(client):
+    """提交→确认之间释放预留后重试:锁定量以确认时为准,原批次直接确认成功。"""
+    _sample(client, "OP-1", "S1", 100)
+    _reserve(client, "RSV-1", "S1", 80)
+    _create(client, sids=("S1",))
+    _submit(client, "STK-1", [("S1", 50)])
+
+    # 首次确认:锁定 80 > 实盘 50,拒绝
+    r = _confirm(client, "STK-1")
+    assert r.status_code == 409
+    assert r.json()["conflicts"][0]["code"] == \
+        "stocktake_counted_below_reserved"
+    assert client.get("/api/v1/stocktakes/STK-1").json()["status"] == "submitted"
+
+    # 释放预留:锁定量归零(提交→确认之间释放以确认时状态判定)
+    rr = client.delete("/api/v1/reservations/RSV-1")
+    assert rr.status_code == 200
+
+    # 重试原批次确认:成功落账,余量 100 -> 50
+    r = _confirm(client, "STK-1")
+    assert r.status_code == 200, r.text
+    body = r.json()
+    assert body["status"] == "confirmed"
+    assert body["replayed"] is False
+    assert body["items"][0]["delta_applied"] == -50.0
+    assert len(body["adjustments"]) == 1
+    avail = client.get("/api/v1/reservations?sample_id=S1").json()["samples"][0]
+    assert avail["remaining"] == 50.0
+    assert avail["reserved"] == 0.0
+    assert avail["available"] == 50.0
+
+    # 成功后幂等重放:不重复写流水
+    r2 = _confirm(client, "STK-1")
+    assert r2.status_code == 200
+    assert r2.json()["replayed"] is True
+    assert len(r2.json()["adjustments"]) == 1
+    avail = client.get("/api/v1/reservations?sample_id=S1").json()["samples"][0]
+    assert avail["remaining"] == 50.0
+
+
+def test_confirm_lock_judged_at_confirm_time_new_reservation_blocks(client):
+    """提交时无预留(实盘 50 可过),确认前新增活跃预留 60:确认按确认时状态拒绝。"""
+    _sample(client, "OP-1", "S1", 100)
+    _create(client, sids=("S1",))
+    _submit(client, "STK-1", [("S1", 50)])
+
+    # 提交→确认之间新增预留,锁定 60 > 实盘 50
+    _reserve(client, "RSV-1", "S1", 60)
+
+    r = _confirm(client, "STK-1")
+    assert r.status_code == 409
+    c = r.json()["conflicts"][0]
+    assert c["code"] == "stocktake_counted_below_reserved"
+    assert c["sample_id"] == "S1"
+    assert c["requested"] == 50.0
+    assert c["available"] == 60.0
+    assert client.get("/api/v1/stocktakes/STK-1").json()["status"] == "submitted"
+
+    # 释放后重试即可确认(无需重建批次/重新提交)
+    client.delete("/api/v1/reservations/RSV-1")
+    r = _confirm(client, "STK-1")
+    assert r.status_code == 200
+    assert r.json()["status"] == "confirmed"
+
+
+def test_confirm_lock_deducts_consumed_amount(client):
+    """锁定量 = 活跃预留原始量 − 已核销合计:部分核销后实盘 50 可确认。"""
+    _sample(client, "OP-1", "S1", 100)
+    _reserve(client, "RSV-1", "S1", 80)
+
+    # 建批前先分次核销 40:余量 100 -> 60,未核销锁定 80 -> 40
+    _consume(client, "CV-1", "RSV-1", "S1", 40)
+    _create(client, sids=("S1",))
+    _submit(client, "STK-1", [("S1", 50)])  # 实盘 50 >= 当前锁定 40
+
+    r = _confirm(client, "STK-1")
+    assert r.status_code == 200, r.text
+    avail = client.get("/api/v1/reservations?sample_id=S1").json()["samples"][0]
+    # 余量调到 50,剩余锁定 40,可用量 10 不为负;预留仍有 40 未核销可继续领用
+    assert avail["remaining"] == 50.0
+    assert avail["reserved"] == 40.0
+    assert avail["available"] == 10.0
+    rsv = client.get("/api/v1/reservations/RSV-1").json()
+    assert rsv["items"][0]["remaining_locked"] == 40.0
+
+
+def test_confirm_lock_boundary_counted_equals_locked(client):
+    """实盘量恰等于锁定量时允许确认(边界相等不冲突),可用量恰好为 0。"""
+    _sample(client, "OP-1", "S1", 100)
+    _reserve(client, "RSV-1", "S1", 50)
+    _create(client, sids=("S1",))
+    _submit(client, "STK-1", [("S1", 50)])
+    r = _confirm(client, "STK-1")
+    assert r.status_code == 200, r.text
+    avail = client.get("/api/v1/reservations?sample_id=S1").json()["samples"][0]
+    assert avail["remaining"] == 50.0
+    assert avail["available"] == 0.0
+
+
+def test_confirm_lock_after_consumption_between_submit_and_confirm(client):
+    """提交→确认之间分次核销:锁定量按确认时状态实时冲减(80 -> 50)。
+
+    核销同时扣减余量并递增版本,故确认返回版本冲突要求重建批次;
+    但锁定校验已按确认时未核销锁定量(50 <= 实盘 60)判定,不再叠加锁定冲突。
+    """
+    _sample(client, "OP-1", "S1", 100)
+    _reserve(client, "RSV-1", "S1", 80)
+    _create(client, sids=("S1",))
+    _submit(client, "STK-1", [("S1", 60)])
+
+    _consume(client, "CV-1", "RSV-1", "S1", 30)  # 余量 100->70、锁定 80->50
+
+    r = _confirm(client, "STK-1")
+    assert r.status_code == 409
+    codes = {c["code"] for c in r.json()["conflicts"]}
+    assert codes == {"stocktake_version_conflict"}
 
 
 # ---------------------------------------------------------------- 账本一致性

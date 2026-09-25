@@ -545,7 +545,12 @@ class StocktakeSubmitRequest(BaseModel):
 
 
 class StocktakeConfirmRequest(BaseModel):
-    """确认盘点:事务内二次校验版本后写调整流水并改余量;任一项冲突整批不改库存。"""
+    """确认盘点:事务内二次校验版本并按确认时活跃预留(扣除已核销)逐项校验
+    实盘量不低于锁定量后写调整流水并改余量;任一项冲突整批不改库存。
+
+    实盘量低于锁定量时批次保持 submitted,释放预留/分次核销使锁定下降后
+    可用同一批次号重试确认;成功后相同操作者/原因的重复确认幂等回放。
+    """
 
     operator: str = Field(min_length=1, description="确认操作者(审计必填)")
     reason: str = Field(min_length=1, description="盘盈/盘亏调整原因(审计必填)")
